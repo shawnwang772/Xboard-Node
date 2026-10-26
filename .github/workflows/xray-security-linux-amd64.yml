@@ -1,0 +1,72 @@
+name: Xboard-Node Xray CA security backport (linux-amd64)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/xray-security-linux-amd64.yml'
+      - '.github/scripts/xray-rootca-backport.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Checkout Xboard-Node
+        uses: actions/checkout@v4
+      - name: Set up Go 1.27.3
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.3'
+          cache: true
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y git
+      - name: Checkout pinned custom Xray fork
+        run: |
+          git clone --filter=blob:none https://github.com/cedar2025/Xray-core.git xray-src
+          git -C xray-src checkout --detach f479355399657c0ed07b3e8ac33e02f727094188
+      - name: Backport Xray v26.10.21 fixed CA bundle
+        run: bash .github/scripts/xray-rootca-backport.sh xray-src
+      - name: Use patched fork and resolve Go modules
+        run: |
+          go mod edit -replace=github.com/xtls/xray-core=./xray-src
+          go mod tidy
+          go mod download
+      - name: Verify fork and updated trust bundle
+        run: |
+          go version
+          go list -m -json github.com/xtls/xray-core
+          go list -m golang.org/x/crypto/x509roots/fallback
+          test "$(go list -m -f '{{.Version}}' golang.org/x/crypto/x509roots/fallback)" = "v0.0.0-20261020153306-9f2b28d4331a"
+          grep -q 'AddCertWithConstraint' xray-src/transport/internet/tls/config_other.go
+      - name: Compile linux amd64
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          go build -trimpath -ldflags '-s -w -X main.version=xray-ca-security-backport-v26.10.21' \
+            -tags 'with_quic with_utls with_wireguard with_acme with_clash_api' \
+            -o xboard-node-linux-amd64 ./cmd/xboard-node
+          go build -trimpath -ldflags '-s -w' -o xbctl-linux-amd64 ./cmd/xbctl
+      - name: Smoke test and dependency metadata
+        run: |
+          ./xboard-node-linux-amd64 -v
+          go version -m ./xboard-node-linux-amd64 | tee build-info.txt
+          grep -F 'golang.org/x/crypto/x509roots/fallback' build-info.txt
+          grep -F 'v0.0.0-20261020153306-9f2b28d4331a' build-info.txt
+          file xboard-node-linux-amd64
+          sha256sum xboard-node-linux-amd64 xbctl-linux-amd64 > SHA256SUMS
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xboard-node-linux-amd64-xray-ca-security-backport
+          path: |
+            xboard-node-linux-amd64
+            xbctl-linux-amd64
+            SHA256SUMS
+            build-info.txt
+          retention-days: 30
